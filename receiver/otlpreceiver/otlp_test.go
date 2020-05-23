@@ -20,6 +20,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"io"
 	"io/ioutil"
 	"net"
 	"net/http"
@@ -41,6 +42,7 @@ import (
 	"google.golang.org/grpc/status"
 
 	"go.opentelemetry.io/collector/component/componenttest"
+	"go.opentelemetry.io/collector/consumer"
 	"go.opentelemetry.io/collector/consumer/pdata"
 	"go.opentelemetry.io/collector/exporter/exportertest"
 	"go.opentelemetry.io/collector/internal/data/testdata"
@@ -56,15 +58,8 @@ func TestGrpcGateway_endToEnd(t *testing.T) {
 
 	// Set the buffer count to 1 to make it flush the test span immediately.
 	sink := new(exportertest.SinkTraceExporter)
-	ocr, err := New(otlpReceiver, "tcp", addr, sink, nil)
-	require.NoError(t, err, "Failed to create trace receiver: %v", err)
-
-	require.NoError(t, ocr.Start(context.Background(), componenttest.NewNopHost()), "Failed to start trace receiver: %v", err)
+	ocr := setupReceiver(t, "tcp", addr, sink, nil)
 	defer ocr.Shutdown(context.Background())
-
-	// TODO(nilebox): make starting server deterministic
-	// Wait for the servers to start
-	<-time.After(10 * time.Millisecond)
 
 	url := fmt.Sprintf("http://%s/v1/trace", addr)
 
@@ -107,28 +102,9 @@ func TestGrpcGateway_endToEnd(t *testing.T) {
 		}
 	  ]
 	}`)
-	req, err := http.NewRequest("POST", url, bytes.NewBuffer(traceJSON))
-	require.NoError(t, err, "Error creating trace POST request: %v", err)
-	req.Header.Set("Content-Type", "application/json")
 
-	client := &http.Client{}
-	resp, err := client.Do(req)
-	require.NoError(t, err, "Error posting trace to grpc-gateway server: %v", err)
-
-	respBytes, err := ioutil.ReadAll(resp.Body)
-	if err != nil {
-		t.Errorf("Error reading response from trace grpc-gateway, %v", err)
-	}
+	respBytes := makeTraceHTTPRequest(t, &http.Client{}, url, "application/json", "application/json", 200, bytes.NewBuffer(traceJSON))
 	respStr := string(respBytes)
-
-	err = resp.Body.Close()
-	if err != nil {
-		t.Errorf("Error closing response body, %v", err)
-	}
-
-	if resp.StatusCode != 200 {
-		t.Errorf("Unexpected status from trace grpc-gateway: %v", resp.StatusCode)
-	}
 
 	if respStr != "{}" {
 		t.Errorf("Got unexpected response from trace grpc-gateway: %v", respStr)
@@ -176,57 +152,22 @@ func TestGrpcGateway_endToEnd(t *testing.T) {
 func TestProtoHttp(t *testing.T) {
 	addr := testutils.GetAvailableLocalAddress(t)
 
-	// Set the buffer count to 1 to make it flush the test span immediately.
 	sink := new(exportertest.SinkTraceExporter)
-	ocr, err := New(otlpReceiver, "tcp", addr, sink, nil)
-	require.NoError(t, err, "Failed to create trace receiver: %v", err)
-
-	require.NoError(t, ocr.Start(context.Background(), componenttest.NewNopHost()), "Failed to start trace receiver: %v", err)
+	ocr := setupReceiver(t, "tcp", addr, sink, nil)
 	defer ocr.Shutdown(context.Background())
-
-	// TODO(nilebox): make starting server deterministic
-	// Wait for the servers to start
-	<-time.After(10 * time.Millisecond)
 
 	url := fmt.Sprintf("http://%s/v1/trace", addr)
 
 	wantOtlp := pdata.TracesToOtlp(testdata.GenerateTraceDataOneSpan())
-
-	traceProto := collectortrace.ExportTraceServiceRequest{
+	traceBytes, err := proto.Marshal(&collectortrace.ExportTraceServiceRequest{
 		ResourceSpans: wantOtlp,
-	}
-	traceBytes, err := proto.Marshal(&traceProto)
+	})
+
 	if err != nil {
-		t.Errorf("Error marshaling protobuf: %v", err)
+		t.Fatalf("Error marshaling protobuf: %v", err)
 	}
 
-	buf := bytes.NewBuffer(traceBytes)
-
-	req, err := http.NewRequest("POST", url, buf)
-	require.NoError(t, err, "Error creating trace POST request: %v", err)
-	req.Header.Set("Content-Type", "application/x-protobuf")
-
-	client := &http.Client{}
-	resp, err := client.Do(req)
-	require.NoError(t, err, "Error posting trace to grpc-gateway server: %v", err)
-
-	respBytes, err := ioutil.ReadAll(resp.Body)
-	if err != nil {
-		t.Fatalf("Error reading response from trace grpc-gateway, %v", err)
-	}
-
-	err = resp.Body.Close()
-	if err != nil {
-		t.Fatalf("Error closing response body, %v", err)
-	}
-
-	if resp.StatusCode != 200 {
-		t.Errorf("Unexpected status from trace grpc-gateway: %v", resp.StatusCode)
-	}
-
-	if resType := resp.Header.Get("Content-Type"); resType != "application/x-protobuf" {
-		t.Errorf("response Content-Type got: %s, want: %s", resType, "application/x-protobuf")
-	}
+	respBytes := makeTraceHTTPRequest(t, &http.Client{}, url, "application/x-protobuf", "application/x-protobuf", 200, bytes.NewBuffer(traceBytes))
 
 	tmp := collectortrace.ExportTraceServiceResponse{}
 	err = proto.Unmarshal(respBytes, &tmp)
@@ -253,20 +194,54 @@ func TestProtoHttp(t *testing.T) {
 
 }
 
-func TestTraceGrpcGatewayCors_endToEnd(t *testing.T) {
-	addr := testutils.GetAvailableLocalAddress(t)
-	corsOrigins := []string{"allowed-*.com"}
+func setupReceiver(t *testing.T, transport, addr string, tc consumer.TraceConsumer, mc consumer.MetricsConsumer, opts ...Option) *Receiver {
 
-	sink := new(exportertest.SinkTraceExporter)
-	ocr, err := New(otlpReceiver, "tcp", addr, sink, nil, WithCorsOrigins(corsOrigins))
-	require.NoError(t, err, "Failed to create trace receiver: %v", err)
-	defer ocr.Shutdown(context.Background())
+	ocr, err := New(otlpReceiver, transport, addr, tc, mc, opts...)
 
+	require.NoError(t, err, "Failed to create OTLP receiver: %v", err)
 	require.NoError(t, ocr.Start(context.Background(), componenttest.NewNopHost()), "Failed to start trace receiver: %v", err)
 
 	// TODO(nilebox): make starting server deterministic
 	// Wait for the servers to start
 	<-time.After(10 * time.Millisecond)
+	return ocr
+}
+
+func makeTraceHTTPRequest(t *testing.T, client *http.Client, url, sendContentType, wantContentType string, wantStatus int, body io.Reader) []byte {
+	req, err := http.NewRequest("POST", url, body)
+	require.NoError(t, err, "Error creating trace POST request: %v", err)
+	req.Header.Set("Content-Type", sendContentType)
+
+	resp, err := client.Do(req)
+	require.NoError(t, err, "Error posting trace to grpc-gateway server: %v", err)
+
+	respBytes, err := ioutil.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("Error reading response from trace grpc-gateway, %v", err)
+	}
+	err = resp.Body.Close()
+	if err != nil {
+		t.Fatalf("Error closing response body, %v", err)
+	}
+
+	if resp.StatusCode != wantStatus {
+		t.Errorf("Unexpected status from trace grpc-gateway: %v", resp.StatusCode)
+	}
+
+	if resType := resp.Header.Get("Content-Type"); resType != wantContentType {
+		t.Errorf("response Content-Type got: %s, want: %s", resType, "application/x-protobuf")
+	}
+
+	return respBytes
+}
+
+func TestTraceGrpcGatewayCors_endToEnd(t *testing.T) {
+	addr := testutils.GetAvailableLocalAddress(t)
+	corsOrigins := []string{"allowed-*.com"}
+
+	sink := new(exportertest.SinkTraceExporter)
+	ocr := setupReceiver(t, "tcp", addr, sink, nil, WithCorsOrigins(corsOrigins))
+	defer ocr.Shutdown(context.Background())
 
 	url := fmt.Sprintf("http://%s/v1/trace", addr)
 
@@ -282,15 +257,8 @@ func TestMetricsGrpcGatewayCors_endToEnd(t *testing.T) {
 	corsOrigins := []string{"allowed-*.com"}
 
 	sink := new(exportertest.SinkMetricsExporter)
-	ocr, err := New(otlpReceiver, "tcp", addr, nil, sink, WithCorsOrigins(corsOrigins))
-	require.NoError(t, err, "Failed to create metrics receiver: %v", err)
+	ocr := setupReceiver(t, "tcp", addr, nil, sink, WithCorsOrigins(corsOrigins))
 	defer ocr.Shutdown(context.Background())
-
-	require.NoError(t, ocr.Start(context.Background(), componenttest.NewNopHost()), "Failed to start metrics receiver: %v", err)
-
-	// TODO(nilebox): make starting server deterministic
-	// Wait for the servers to start
-	<-time.After(10 * time.Millisecond)
 
 	url := fmt.Sprintf("http://%s/v1/metrics", addr)
 
@@ -306,13 +274,9 @@ func TestMetricsGrpcGatewayCors_endToEnd(t *testing.T) {
 // redirect them to the web-grpc-gateway endpoint.
 func TestAcceptAllGRPCProtoAffiliatedContentTypes(t *testing.T) {
 	t.Skip("Currently a flaky test as we need a way to flush all written traces")
-
 	addr := testutils.GetAvailableLocalAddress(t)
 	cbts := new(exportertest.SinkTraceExporter)
-	ocr, err := New(otlpReceiver, "tcp", addr, cbts, nil)
-	require.NoError(t, err, "Failed to create trace receiver: %v", err)
-
-	require.NoError(t, ocr.Start(context.Background(), componenttest.NewNopHost()), "Failed to start the trace receiver: %v", err)
+	ocr := setupReceiver(t, "tcp", addr, cbts, nil)
 	defer ocr.Shutdown(context.Background())
 
 	// Now start the client with the various Proto affiliated gRPC Content-SubTypes as per:
@@ -486,10 +450,7 @@ func tempSocketName(t *testing.T) string {
 func TestReceiveOnUnixDomainSocket_endToEnd(t *testing.T) {
 	socketName := tempSocketName(t)
 	cbts := new(exportertest.SinkTraceExporter)
-	r, err := New(otlpReceiver, "unix", socketName, cbts, nil)
-	require.NoError(t, err)
-	require.NotNil(t, r)
-	require.NoError(t, r.Start(context.Background(), componenttest.NewNopHost()))
+	r := setupReceiver(t, "unix", socketName, cbts, nil)
 	defer r.Shutdown(context.Background())
 
 	// Wait for the servers to start
@@ -524,16 +485,11 @@ func TestReceiveOnUnixDomainSocket_endToEnd(t *testing.T) {
 		},
 	}
 
-	response, err := c.Post("http://unix/v1/trace", "application/json", strings.NewReader(span))
-	require.NoError(t, err)
-	defer response.Body.Close()
+	bodyBytes := makeTraceHTTPRequest(t, &c, "http://unix/v1/trace", "application/json", "application/json", 200, strings.NewReader(span))
 
-	bodyBytes, err := ioutil.ReadAll(response.Body)
-	require.NoError(t, err)
 	bodyString := string(bodyBytes)
 	fmt.Println(bodyString)
 
-	require.Equal(t, 200, response.StatusCode)
 }
 
 // TestOTLPReceiverTrace_HandleNextConsumerResponse checks if the trace receiver
@@ -633,13 +589,7 @@ func TestOTLPReceiverTrace_HandleNextConsumerResponse(t *testing.T) {
 
 				sink := new(exportertest.SinkTraceExporter)
 
-				var opts []Option
-				ocr, err := New(otlpReceiver, "tcp", addr, nil, nil, opts...)
-				require.Nil(t, err)
-				require.NotNil(t, ocr)
-
-				ocr.traceConsumer = sink
-				require.Nil(t, ocr.Start(context.Background(), componenttest.NewNopHost()))
+				ocr := setupReceiver(t, "tcp", addr, sink, nil)
 				defer ocr.Shutdown(context.Background())
 
 				cc, err := grpc.Dial(addr, grpc.WithInsecure(), grpc.WithBlock())
